@@ -1,0 +1,25 @@
+{
+  "name": "html-validate-templates",
+  "private": true,
+  "description": "html-validate plugins for server-side templates (Blade, Twig, Nunjucks, Handlebars)",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "npm run typecheck && npm test && npm run build && node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "html-validate": "^11.18.0",
+    "tsup": "^9.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5"
+  },
+  "engines": {
+    "node": "^22.22.0 || >=24.8.0"
+  }
+}

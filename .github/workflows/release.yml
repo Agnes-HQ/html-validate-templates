@@ -1,0 +1,33 @@
+name: Release
+
+# Pushing a tag like v0.1.0 publishes the three packages at that version. Publishing uses npm's trusted publishing
+# (GitHub's OIDC token), so no npm token is stored in this repository; each package must list this workflow as its
+# trusted publisher on npmjs.com.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest
+      - run: npm ci
+      - run: npm run check
+      - name: Check the tag matches the package versions
+        run: |
+          for p in blade twig handlebars; do
+            v=$(node -p "require('./packages/$p/package.json').version")
+            test "v$v" = "$GITHUB_REF_NAME" || { echo "packages/$p is $v, the tag is $GITHUB_REF_NAME"; exit 1; }
+          done
+      - run: npm publish --workspace packages/blade --workspace packages/twig --workspace packages/handlebars
