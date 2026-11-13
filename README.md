@@ -1,3 +1,5 @@
+[![Agnes health score](https://app.agnes.dev/badge/9908d5d7-0911-4a03-b2a7-7a6da3ce7370.svg)](https://app.agnes.dev/p/9908d5d7-0911-4a03-b2a7-7a6da3ce7370)
+
 # html-validate-templates
 
 [html-validate](https://html-validate.org) plugins for server-side templates. They lint the HTML in Blade, Twig, Nunjucks and Handlebars files, with every finding at the right line and column of your template.
