@@ -64,155 +64,235 @@ export interface MaskResult {
 const RAW_TEXT = new Set(["script", "style", "textarea", "title"]);
 
 export function mask(src: string, syntax: Syntax): MaskResult {
-  const out: string[] = new Array(src.length);
-  let state = "text" as HtmlState; // not narrowed: `advance` changes it from a closure
-  let tagName = "";
-  let rawName = "";
-  const stack: Array<{ name: string; start: number; started?: boolean }> = [];
-  const conditionals: Array<[number, number]> = [];
-  let blankFrom = -1; // the stack depth whose rest is being blanked, or -1
+  return new Masker(src, syntax).run();
+}
 
-  const fill = (from: number, to: number, ch: string) => {
-    for (let k = from; k < to; k++) out[k] = src[k] === "\n" || src[k] === "\r" ? src[k]! : ch;
-  };
-  const advance = (k: number) => {
-    ({ state, tagName, rawName } = step(src, k, state, tagName, rawName));
-  };
+/** Where the HTML state machine is: the state, the tag name so far, and the raw text element it is in. */
+interface HtmlCursor {
+  state: HtmlState;
+  tagName: string;
+  rawName: string;
+}
 
-  let i = 0;
-  while (i < src.length) {
-    const tok = syntax.match(src, i, state);
-    if (tok) {
-      if (tok.kind === "control" && tok.name) {
-        // a closing tag ends its own block, and any inner block a template left open
-        const closing = stack.findLastIndex((b) => syntax.closes(tok.name!, b.name));
-        if (closing !== -1) {
-          while (stack.length > closing) conditionals.push([stack.pop()!.start, tok.end]);
-          if (blankFrom > stack.length) blankFrom = -1;
-        } else if (stack.length > 0 && syntax.startsFirstBranch?.(tok.name, stack[stack.length - 1]!.name) && !stack[stack.length - 1]!.started) {
-          stack[stack.length - 1]!.started = true;
-        } else if (stack.length > 0 && syntax.isBranch(tok.name, stack[stack.length - 1]!.name)) {
-          if (blankFrom === -1) blankFrom = stack.length;
-        } else if (syntax.opens(tok.name)) {
-          stack.push({ name: tok.name, start: i });
-        }
-      }
+interface Block {
+  name: string;
+  start: number;
+  /** A switch whose first case has been seen. */
+  started?: boolean;
+}
 
-      if (blankFrom !== -1) {
-        fill(i, tok.end, " ");
-      } else if (tok.verbatimEnd) {
-        const { start, end } = tok.verbatimEnd;
-        fill(i, tok.end, " ");
-        for (let k = tok.end; k < start; k++) {
-          out[k] = src[k]!;
-          advance(k);
-        }
-        fill(start, end, " ");
-        i = end;
-        continue;
-      } else if (state === "dq" || state === "sq" || state === "unq") {
-        fill(i, tok.end, tok.kind === "comment" ? " " : SENTINEL);
-      } else if (state === "beforeValue") {
-        fill(i, tok.end, SENTINEL);
-        state = "unq";
-      } else if (state === "text" && tok.kind === "output" && (src[i - 1] === "<" || src.slice(i - 2, i) === "</")) {
-        // a dynamic tag name, `<{{ tag }}>`: a custom element name of the same length
-        fill(i, tok.end, "x");
-        if (tok.end - i >= 2) out[i + 1] = "-";
-        state = "tagName";
-        tagName = src[i - 1] === "/" ? "/x-" : "x-";
-      } else if (state === "tagName" && tok.kind === "output" && tagName.replace("/", "") !== "") {
-        // output glued to a tag name, `<h{{ level }}>`: the rest of a custom element name, `<h-xxxxxxx>`
-        fill(i, tok.end, "x");
-        out[i] = "-";
-        tagName += "-";
-      } else if ((state === "tag" || state === "tagName") && tok.kind === "output" && /^\s*=/.test(src.slice(tok.end, tok.end + 8))) {
-        // a dynamic attribute name, `{{ key }}="…"`: a placeholder name of the same length
-        fill(i, tok.end, "x");
-        state = "tag";
-      } else if (state === "tag" || state === "tagName") {
-        fill(i, tok.end, " ");
-        if (state === "tagName") state = "tag";
-      } else if (state === "text" && tok.kind === "output") {
-        fill(i, tok.end, "x");
-      } else {
-        fill(i, tok.end, " ");
-      }
-      i = tok.end;
-      continue;
-    }
+/** One pass of {@link mask} over a source. */
+class Masker {
+  private readonly src: string;
+  private readonly syntax: Syntax;
+  /** The masked output, one character per source character; every index is overwritten. */
+  private readonly out: string[];
+  private readonly html: HtmlCursor = { state: "text", tagName: "", rawName: "" };
+  private readonly stack: Block[] = [];
+  private readonly conditionals: Array<[number, number]> = [];
+  /** The stack depth whose rest is being blanked, or -1. */
+  private blankFrom = -1;
 
-    if (blankFrom !== -1) {
-      fill(i, i + 1, " ");
-      i++;
-      continue;
-    }
-    out[i] = state === "tagName" && syntax.componentChar ? syntax.componentChar(tagName, src[i]!) : src[i]!;
-    advance(i);
-    i++;
+  constructor(src: string, syntax: Syntax) {
+    this.src = src;
+    this.syntax = syntax;
+    this.out = src.split("");
   }
 
-  // blocks a template never closed run to its end
-  while (stack.length > 0) conditionals.push([stack.pop()!.start, src.length]);
-  const data = out.join("");
-  return { data, attributes: attributesOf(data, conditionals) };
+  run(): MaskResult {
+    let i = 0;
+    while (i < this.src.length) {
+      const tok = this.syntax.match(this.src, i, this.html.state);
+      i = tok ? this.token(tok, i) : this.char(i);
+    }
+    // blocks a template never closed run to its end
+    while (this.stack.length > 0) this.conditionals.push([this.stack.pop()!.start, this.src.length]);
+    const data = this.out.join("");
+    return { data, attributes: attributesOf(data, this.conditionals) };
+  }
+
+  /** Masks the template token at `i`; returns the index to go on from. */
+  private token(tok: Token, i: number): number {
+    if (tok.kind === "control" && tok.name) this.trackBlock(tok.name, i, tok.end);
+    if (this.blankFrom !== -1) this.fill(i, tok.end, " ");
+    else if (tok.verbatimEnd) return this.verbatim(i, tok.end, tok.verbatimEnd);
+    else this.maskToken(tok, i);
+    return tok.end;
+  }
+
+  /** Copies the source character at `i`, or blanks it inside a branch being left out. */
+  private char(i: number): number {
+    if (this.blankFrom !== -1) {
+      this.fill(i, i + 1, " ");
+      return i + 1;
+    }
+    const ch = this.src[i]!;
+    const { componentChar } = this.syntax;
+    this.out[i] = this.html.state === "tagName" && componentChar ? componentChar(this.html.tagName, ch) : ch;
+    step(this.src, i, this.html);
+    return i + 1;
+  }
+
+  /** Updates the open blocks for the control token `name` from `start` to `end`. */
+  private trackBlock(name: string, start: number, end: number) {
+    const { stack, syntax } = this;
+    // a closing tag ends its own block, and any inner block a template left open
+    const closing = stack.findLastIndex((b) => syntax.closes(name, b.name));
+    const top = stack[stack.length - 1];
+    if (closing !== -1) {
+      while (stack.length > closing) this.conditionals.push([stack.pop()!.start, end]);
+      if (this.blankFrom > stack.length) this.blankFrom = -1;
+    } else if (top && !top.started && syntax.startsFirstBranch?.(name, top.name)) {
+      top.started = true;
+    } else if (top && syntax.isBranch(name, top.name)) {
+      if (this.blankFrom === -1) this.blankFrom = stack.length;
+    } else if (syntax.opens(name)) {
+      stack.push({ name, start });
+    }
+  }
+
+  /** A verbatim block: its tags are blanked and its content kept as HTML. Returns the index past its closing tag. */
+  private verbatim(i: number, end: number, close: { start: number; end: number }): number {
+    this.fill(i, end, " ");
+    for (let k = end; k < close.start; k++) {
+      this.out[k] = this.src[k]!;
+      step(this.src, k, this.html);
+    }
+    this.fill(close.start, close.end, " ");
+    return close.end;
+  }
+
+  /** Replaces a template token with what fits where it is in the HTML. */
+  private maskToken(tok: Token, i: number) {
+    switch (this.html.state) {
+      case "dq":
+      case "sq":
+      case "unq":
+      case "beforeValue":
+        return this.maskInValue(tok, i);
+      case "tag":
+      case "tagName":
+        return this.maskInTag(tok, i);
+      case "text":
+        return this.maskInText(tok, i);
+      default:
+        // a comment, script or style
+        return this.fill(i, tok.end, " ");
+    }
+  }
+
+  /** In an attribute value, or where one starts: a dynamic value, but a template comment is left out. */
+  private maskInValue(tok: Token, i: number) {
+    if (this.html.state === "beforeValue") {
+      this.fill(i, tok.end, SENTINEL);
+      this.html.state = "unq";
+    } else {
+      this.fill(i, tok.end, tok.kind === "comment" ? " " : SENTINEL);
+    }
+  }
+
+  /** In a tag, after or glued to its name. */
+  private maskInTag(tok: Token, i: number) {
+    const output = tok.kind === "output";
+    if (output && this.html.state === "tagName" && this.html.tagName.replace("/", "") !== "") {
+      // output glued to a tag name, `<h{{ level }}>`: the rest of a custom element name, `<h-xxxxxxx>`
+      this.fill(i, tok.end, "x");
+      this.out[i] = "-";
+      this.html.tagName += "-";
+      return;
+    }
+    // a dynamic attribute name, `{{ key }}="…"`, becomes a placeholder name of the same length; output in attribute
+    // position (`<div {{ attributes }}>`) and control tags become spaces
+    const attributeName = output && /^\s*=/.test(this.src.slice(tok.end, tok.end + 8));
+    this.fill(i, tok.end, attributeName ? "x" : " ");
+    this.html.state = "tag";
+  }
+
+  /** In text: output keeps the element's text, other tokens print nothing. */
+  private maskInText(tok: Token, i: number) {
+    const { src } = this;
+    if (tok.kind !== "output") {
+      this.fill(i, tok.end, " ");
+      return;
+    }
+    this.fill(i, tok.end, "x");
+    if (src[i - 1] === "<" || src.slice(i - 2, i) === "</") {
+      // a dynamic tag name, `<{{ tag }}>`: a custom element name of the same length
+      if (tok.end - i >= 2) this.out[i + 1] = "-";
+      this.html.state = "tagName";
+      this.html.tagName = src[i - 1] === "/" ? "/x-" : "x-";
+    }
+  }
+
+  /** Fills `from`–`to` with `ch`, keeping line breaks. */
+  private fill(from: number, to: number, ch: string) {
+    for (let k = from; k < to; k++) this.out[k] = this.src[k] === "\n" || this.src[k] === "\r" ? this.src[k]! : ch;
+  }
 }
+
+type Stepper = (c: string, src: string, i: number, at: HtmlCursor) => void;
+
+/** How each HTML state moves on over the character `c` at `i`. */
+const STEPS: Record<HtmlState, Stepper> = {
+  text(c, src, i, at) {
+    if (c !== "<") return;
+    if (src.startsWith("<!--", i)) {
+      at.state = "comment";
+    } else if (isTagStart(src, i)) {
+      at.state = "tagName";
+      at.tagName = "";
+    } else if (src[i + 1] === "!" || src[i + 1] === "?") {
+      at.state = "tag";
+      at.tagName = "!";
+    }
+  },
+  tagName(c, _src, _i, at) {
+    if (c === "/" && at.tagName === "") at.tagName = "/"; // an end tag: never enters raw text
+    else if (/\s/.test(c)) at.state = "tag";
+    else if (c === ">") at.state = contentOf(at.tagName);
+    else at.tagName += c.toLowerCase();
+  },
+  tag(c, src, i, at) {
+    if (c === ">") at.state = src[i - 1] === "/" ? "text" : contentOf(at.tagName);
+    else if (c === "=") at.state = "beforeValue";
+  },
+  beforeValue(c, _src, _i, at) {
+    if (c === '"') at.state = "dq";
+    else if (c === "'") at.state = "sq";
+    else if (c === ">") at.state = contentOf(at.tagName);
+    else if (!/\s/.test(c)) at.state = "unq";
+  },
+  dq(c, _src, _i, at) {
+    if (c === '"') at.state = "tag";
+  },
+  sq(c, _src, _i, at) {
+    if (c === "'") at.state = "tag";
+  },
+  unq(c, _src, _i, at) {
+    if (/\s/.test(c)) at.state = "tag";
+    else if (c === ">") at.state = contentOf(at.tagName);
+  },
+  comment(c, src, i, at) {
+    if (c === ">" && src.slice(i - 2, i) === "--") at.state = "text";
+  },
+  raw(c, src, i, at) {
+    if (c === "<" && src.slice(i, i + 2 + at.rawName.length).toLowerCase() === `</${at.rawName}`) {
+      at.state = "tagName";
+      at.tagName = "";
+    }
+  },
+};
 
 /** Advances the HTML state machine over one character. */
-function step(src: string, i: number, state: HtmlState, tagName: string, rawName: string) {
-  const c = src[i]!;
-  switch (state) {
-    case "text":
-      if (c === "<") {
-        if (src.startsWith("<!--", i)) state = "comment";
-        else if (/[A-Za-z]/.test(src[i + 1] ?? "") || (src[i + 1] === "/" && /[A-Za-z]/.test(src[i + 2] ?? ""))) {
-          state = "tagName";
-          tagName = "";
-        } else if (src[i + 1] === "!" || src[i + 1] === "?") {
-          state = "tag";
-          tagName = "!";
-        }
-      }
-      break;
-    case "tagName":
-      if (c === "/" && tagName === "") tagName = "/"; // an end tag: never enters raw text
-      else if (/\s/.test(c)) state = "tag";
-      else if (c === ">") state = contentOf(tagName);
-      else tagName += c.toLowerCase();
-      break;
-    case "tag":
-      if (c === ">") state = src[i - 1] === "/" ? "text" : contentOf(tagName);
-      else if (c === "=") state = "beforeValue";
-      break;
-    case "beforeValue":
-      if (c === '"') state = "dq";
-      else if (c === "'") state = "sq";
-      else if (c === ">") state = contentOf(tagName);
-      else if (!/\s/.test(c)) state = "unq";
-      break;
-    case "dq":
-      if (c === '"') state = "tag";
-      break;
-    case "sq":
-      if (c === "'") state = "tag";
-      break;
-    case "unq":
-      if (/\s/.test(c)) state = "tag";
-      else if (c === ">") state = contentOf(tagName);
-      break;
-    case "comment":
-      if (c === ">" && src.slice(i - 2, i) === "--") state = "text";
-      break;
-    case "raw":
-      if (c === "<" && src.slice(i, i + 2 + rawName.length).toLowerCase() === `</${rawName}`) {
-        state = "tagName";
-        tagName = "";
-      }
-      break;
-  }
-  if (state === "raw" && RAW_TEXT.has(tagName)) rawName = tagName;
-  return { state, tagName, rawName };
+function step(src: string, i: number, at: HtmlCursor) {
+  STEPS[at.state](src[i]!, src, i, at);
+  if (at.state === "raw" && RAW_TEXT.has(at.tagName)) at.rawName = at.tagName;
 }
+
+const isLetter = (c: string | undefined) => /[A-Za-z]/.test(c ?? "");
+
+/** A start or end tag opens at `i`: `<` followed by a letter, or by `/` and a letter. */
+const isTagStart = (src: string, i: number) => isLetter(src[i + 1]) || (src[i + 1] === "/" && isLetter(src[i + 2]));
 
 const contentOf = (tagName: string): HtmlState => (RAW_TEXT.has(tagName) ? "raw" : "text");
 
@@ -226,8 +306,7 @@ export function attributesOf(html: string, conditionals: ReadonlyArray<readonly 
   let i = 0;
   while (i < html.length) {
     if (html.startsWith("<!--", i)) {
-      const end = html.indexOf("-->", i + 4);
-      i = end === -1 ? html.length : end + 3;
+      i = until(html, i + 4, "-->");
       continue;
     }
     const open = /^<([A-Za-z][^\s/>]*)/.exec(html.slice(i, i + 256));
@@ -236,36 +315,50 @@ export function attributesOf(html: string, conditionals: ReadonlyArray<readonly 
       continue;
     }
     const name = open[1]!.toLowerCase();
-    i += open[0].length;
-    // attributes up to the end of the tag
-    while (i < html.length && html[i] !== ">") {
-      if (/[\s/]/.test(html[i]!)) {
-        i++;
-        continue;
-      }
-      const start = i;
-      while (i < html.length && !/[\s/>=]/.test(html[i]!)) i++;
-      found.push({ key: html.slice(start, i).toLowerCase(), conditional: inConditional(start) });
-      while (/\s/.test(html[i] ?? "")) i++;
-      if (html[i] !== "=") continue;
-      i++;
-      while (/\s/.test(html[i] ?? "")) i++;
-      const q = html[i];
-      if (q === '"' || q === "'") {
-        const end = html.indexOf(q, i + 1);
-        i = end === -1 ? html.length : end + 1;
-      } else {
-        while (i < html.length && !/[\s>]/.test(html[i]!)) i++;
-      }
-    }
-    i++;
+    i = readAttributes(html, i + open[0].length, (key, start) => found.push({ key, conditional: inConditional(start) }));
     // script and style content is text, not markup
-    if (RAW_TEXT.has(name)) {
-      const close = html.toLowerCase().indexOf(`</${name}`, i);
-      i = close === -1 ? html.length : close;
-    }
+    if (RAW_TEXT.has(name)) i = skipRawText(html, i, name);
   }
   return found;
+}
+
+/** Reads the attributes of a start tag from just after its name; returns the index just past its `>`. */
+function readAttributes(html: string, from: number, onAttribute: (key: string, start: number) => void): number {
+  let i = from;
+  while (i < html.length && html[i] !== ">") {
+    if (/[\s/]/.test(html[i]!)) {
+      i++;
+      continue;
+    }
+    const start = i;
+    while (i < html.length && !/[\s/>=]/.test(html[i]!)) i++;
+    onAttribute(html.slice(start, i).toLowerCase(), start);
+    i = skipAttributeValue(html, i);
+  }
+  return i + 1;
+}
+
+/** From just after an attribute name: the index past its `= value`, or past the spaces after it when it has none. */
+function skipAttributeValue(html: string, from: number): number {
+  let i = skipSpaces(html, from);
+  if (html[i] !== "=") return i;
+  i = skipSpaces(html, i + 1);
+  const q = html[i];
+  if (q === '"' || q === "'") return until(html, i + 1, q);
+  while (i < html.length && !/[\s>]/.test(html[i]!)) i++;
+  return i;
+}
+
+function skipSpaces(s: string, from: number): number {
+  let i = from;
+  while (/\s/.test(s[i] ?? "")) i++;
+  return i;
+}
+
+/** The index of the end tag of the raw text element `name` from `from`, or the end of the HTML. */
+function skipRawText(html: string, from: number, name: string): number {
+  const close = html.toLowerCase().indexOf(`</${name}`, from);
+  return close === -1 ? html.length : close;
 }
 
 /** Index just past the `)` matching the `(` at `i`, skipping quoted strings; -1 when unbalanced. */
@@ -273,13 +366,18 @@ export function balancedParen(src: string, i: number): number {
   let depth = 0;
   for (let k = i; k < src.length; k++) {
     const c = src[k];
-    if (c === "'" || c === '"') {
-      const q = c;
-      for (k++; k < src.length && src[k] !== q; k++) if (src[k] === "\\") k++;
-    } else if (c === "(") depth++;
+    if (c === "'" || c === '"') k = closingQuote(src, k);
+    else if (c === "(") depth++;
     else if (c === ")" && --depth === 0) return k + 1;
   }
   return -1;
+}
+
+/** Index of the quote that closes the string opening at `i`, skipping escaped characters; past the end if none. */
+function closingQuote(src: string, i: number): number {
+  let k = i + 1;
+  while (k < src.length && src[k] !== src[i]) k += src[k] === "\\" ? 2 : 1;
+  return k;
 }
 
 /** Index just past the next `close` from `from`, or the end of the source when there is none. */
