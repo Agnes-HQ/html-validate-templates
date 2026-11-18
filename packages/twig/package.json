@@ -1,6 +1,6 @@
 {
   "name": "html-validate-twig",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lint the HTML in Twig and Nunjucks templates with html-validate.",
   "keywords": [
     "html-validate",

@@ -1,6 +1,6 @@
 {
   "name": "html-validate-handlebars",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lint the HTML in Handlebars templates with html-validate.",
   "keywords": [
     "html-validate",

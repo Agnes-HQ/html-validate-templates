@@ -1,6 +1,6 @@
 {
   "name": "html-validate-blade",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lint the HTML in Laravel Blade templates with html-validate.",
   "keywords": [
     "html-validate",
