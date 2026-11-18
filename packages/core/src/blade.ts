@@ -1,4 +1,4 @@
-import { balancedParen, until, type Syntax } from "./mask";
+import { balancedParen, until, type HtmlState, type Syntax, type Token } from "./mask";
 
 /** Blocks with branches; everything after the first branch is blanked. */
 const BRANCHED = new Set([
@@ -29,41 +29,16 @@ export const blade: Syntax = {
     return ch;
   },
   match(src, i, state) {
-    const c = src[i];
-    if (c === "{") {
-      if (src.startsWith("{{--", i)) return { end: until(src, i + 4, "--}}"), kind: "comment" };
-      if (src.startsWith("{!!", i)) return { end: until(src, i + 3, "!!}"), kind: "output" };
-      if (src.startsWith("{{", i)) return { end: until(src, i + 2, "}}"), kind: "output" };
-      return null;
+    switch (src[i]) {
+      case "{":
+        return matchBrace(src, i);
+      case "<":
+        return matchPhp(src, i);
+      case "@":
+        return matchDirective(src, i, state);
+      default:
+        return null;
     }
-    if (c === "<" && src.startsWith("<?php", i)) return { end: until(src, i + 5, "?>"), kind: "control" };
-    if (c === "<" && src.startsWith("<?=", i)) return { end: until(src, i + 3, "?>"), kind: "output" };
-    if (c !== "@") return null;
-    if (i > 0 && /\w/.test(src[i - 1]!)) return null; // name@example.com: Blade only sees a directive after a non-word
-    if (src.startsWith("@{{", i)) return { end: until(src, i + 3, "}}"), kind: "output" }; // printed as {{ }} for Vue or Alpine
-    if (src[i + 1] === "@") return { end: i + 2, kind: "output" }; // @@foo prints @foo
-    const m = /^@([A-Za-z_]\w*(?:::\w+)?)/.exec(src.slice(i, i + 64));
-    if (!m) return null;
-    const name = m[1]!.toLowerCase();
-    let end = i + m[0].length;
-    let k = end;
-    while (src[k] === " " || src[k] === "\t") k++;
-    const hasArgs = src[k] === "(";
-    // in a tag, `@click="…"` and `@click.prevent` are Alpine or Vue attributes, not Blade
-    if ((state === "tag" || state === "tagName") && !hasArgs && /^[=.:]/.test(src.slice(end).trimStart())) return null;
-    // an unknown word without arguments is text (`@username`), as Blade leaves it
-    if (!hasArgs && !BARE.has(name)) return null;
-    if (hasArgs) {
-      const close = balancedParen(src, k);
-      if (close !== -1) end = close;
-    }
-    if (name === "php" && !hasArgs) return { end: until(src, end, "@endphp"), kind: "control" };
-    if (name === "verbatim") {
-      const start = src.indexOf("@endverbatim", end);
-      if (start !== -1) return { end, kind: "control", verbatimEnd: { start, end: start + "@endverbatim".length } };
-    }
-    // `@empty($x)` opens a conditional; a bare `@empty` is the else branch of `@forelse`
-    return { end, kind: "control", name: name === "empty" && hasArgs ? "emptycheck" : name };
   },
   opens: (name) => BRANCHED.has(name) || name === "emptycheck",
   isBranch(name, open) {
@@ -74,3 +49,54 @@ export const blade: Syntax = {
   startsFirstBranch: (name, open) => open === "switch" && name === "case",
   closes: (name, open) => name === (open === "emptycheck" ? "endempty" : `end${open}`),
 };
+
+/** `{{-- comment --}}`, `{!! raw output !!}` and `{{ output }}`. */
+function matchBrace(src: string, i: number): Token | null {
+  if (src.startsWith("{{--", i)) return { end: until(src, i + 4, "--}}"), kind: "comment" };
+  if (src.startsWith("{!!", i)) return { end: until(src, i + 3, "!!}"), kind: "output" };
+  if (src.startsWith("{{", i)) return { end: until(src, i + 2, "}}"), kind: "output" };
+  return null;
+}
+
+/** `<?php ?>` and `<?= ?>`. */
+function matchPhp(src: string, i: number): Token | null {
+  if (src.startsWith("<?php", i)) return { end: until(src, i + 5, "?>"), kind: "control" };
+  if (src.startsWith("<?=", i)) return { end: until(src, i + 3, "?>"), kind: "output" };
+  return null;
+}
+
+/** A directive, `@{{ }}` or `@@` at the `@` at `i`. */
+function matchDirective(src: string, i: number, state: HtmlState): Token | null {
+  if (i > 0 && /\w/.test(src[i - 1]!)) return null; // name@example.com: Blade only sees a directive after a non-word
+  if (src.startsWith("@{{", i)) return { end: until(src, i + 3, "}}"), kind: "output" }; // printed as {{ }} for Vue or Alpine
+  if (src[i + 1] === "@") return { end: i + 2, kind: "output" }; // @@foo prints @foo
+  const m = /^@([A-Za-z_]\w*(?:::\w+)?)/.exec(src.slice(i, i + 64));
+  if (!m) return null;
+  const name = m[1]!.toLowerCase();
+  const nameEnd = i + m[0].length;
+  let k = nameEnd;
+  while (src[k] === " " || src[k] === "\t") k++;
+  const hasArgs = src[k] === "(";
+  if (!hasArgs && !isBareDirective(src, nameEnd, name, state)) return null;
+  const close = hasArgs ? balancedParen(src, k) : -1;
+  return directive(src, name, close === -1 ? nameEnd : close, hasArgs);
+}
+
+/** A directive without arguments: a name Blade knows, and in a tag not an Alpine or Vue attribute. */
+function isBareDirective(src: string, nameEnd: number, name: string, state: HtmlState): boolean {
+  // in a tag, `@click="…"` and `@click.prevent` are Alpine or Vue attributes, not Blade
+  if ((state === "tag" || state === "tagName") && /^[=.:]/.test(src.slice(nameEnd).trimStart())) return false;
+  // an unknown word without arguments is text (`@username`), as Blade leaves it
+  return BARE.has(name);
+}
+
+/** The token for the directive `name` ending at `end`: `@php` and `@verbatim` blocks, and `@empty` as a conditional. */
+function directive(src: string, name: string, end: number, hasArgs: boolean): Token {
+  if (name === "php" && !hasArgs) return { end: until(src, end, "@endphp"), kind: "control" };
+  if (name === "verbatim") {
+    const start = src.indexOf("@endverbatim", end);
+    if (start !== -1) return { end, kind: "control", verbatimEnd: { start, end: start + "@endverbatim".length } };
+  }
+  // `@empty($x)` opens a conditional; a bare `@empty` is the else branch of `@forelse`
+  return { end, kind: "control", name: name === "empty" && hasArgs ? "emptycheck" : name };
+}
